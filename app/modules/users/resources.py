@@ -8,9 +8,9 @@ RESTful API User resources
 import logging
 
 from flask_login import current_user
-from flask_restplus import Resource
+from flask_restplus_patched import Resource
 
-from app.extensions.api import Namespace, abort, http_exceptions
+from app.extensions.api import Namespace, http_exceptions
 from app.extensions.api.parameters import PaginationParameters
 
 from . import permissions, schemas, parameters
@@ -73,6 +73,7 @@ class UserSignupForm(Resource):
 
 
 @api.route('/<int:user_id>')
+@api.resolve_object_by_model(User, 'user')
 @api.response(
     code=http_exceptions.NotFound.code,
     description="User not found.",
@@ -83,7 +84,6 @@ class UserByID(Resource):
     """
 
     @api.login_required(oauth_scopes=['users:read'])
-    @api.resolve_object_by_model(User, 'user')
     @api.permission_required(
         permissions.OwnerRolePermission,
         kwargs_on_request=lambda kwargs: {'obj': kwargs['user']}
@@ -96,7 +96,6 @@ class UserByID(Resource):
         return user
 
     @api.login_required(oauth_scopes=['users:write'])
-    @api.resolve_object_by_model(User, 'user')
     @api.permission_required(
         permissions.OwnerRolePermission,
         kwargs_on_request=lambda kwargs: {'obj': kwargs['user']}
