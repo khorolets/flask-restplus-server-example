@@ -3,18 +3,25 @@
 Extended Api Namespace implementation with an application-specific helpers
 --------------------------------------------------------------------------
 """
+from contextlib import contextmanager
 from functools import wraps
 
 import flask_marshmallow
+import sqlalchemy
+from werkzeug.exceptions import HTTPException
+
 from flask_restplus_patched import Namespace as BaseNamespace
 
 from . import http_exceptions
+from .webargs_parser import CustomWebargsParser
 
 
 class Namespace(BaseNamespace):
     """
     Having app-specific handlers here.
     """
+
+    WEBARGS_PARSER = CustomWebargsParser()
 
     def resolve_object_by_model(self, model, object_arg_name, identity_arg_name=None):
         """
@@ -63,29 +70,108 @@ class Namespace(BaseNamespace):
         This decorator automatically applies the following features:
 
         * ``OAuth2.require_oauth`` decorator requires authentication;
-        * ``permissions.ActivatedUserRolePermission`` decorator ensures
+        * ``permissions.ActiveUserRolePermission`` decorator ensures
           minimal authorization level;
         * All of the above requirements are put into OpenAPI Specification with
           relevant options and in a text description.
+
+        Arguments:
+            oauth_scopes (list) - a list of required OAuth2 Scopes (strings)
+
+        Example:
+        >>> class Users(Resource):
+        ...     @namespace.login_required(oauth_scopes=['users:read'])
+        ...     def get(self):
+        ...         return []
+        ...
+        >>> @namespace.login_required(oauth_scopes=['users:read'])
+        ... class Users(Resource):
+        ...     def get(self):
+        ...         return []
+        ...
+        ...     @namespace.login_required(oauth_scopes=['users:write'])
+        ...     def post(self):
+        ...         return User()
+        ...
+        >>> @namespace.login_required(oauth_scopes=[])
+        ... class Users(Resource):
+        ...     @namespace.login_required(oauth_scopes=['users:read'])
+        ...     def get(self):
+        ...         return []
+        ...
+        ...     @namespace.login_required(oauth_scopes=['users:write'])
+        ...     def post(self):
+        ...         return User()
         """
-        def decorator(func):
+        def decorator(func_or_class):
             """
             A helper wrapper.
             """
+            if isinstance(func_or_class, type):
+                # Handle Resource classes decoration
+                # pylint: disable=protected-access
+                func_or_class._apply_decorator_to_methods(decorator)
+                return func_or_class
+            else:
+                func = func_or_class
+
             # Avoid circilar dependency
             from app.extensions import oauth2
             from app.modules.users import permissions
 
-            # Automatically apply `permissions.ActivatedUserRolePermisson`
+            # This way we will avoid unnecessary checks if the decorator is
+            # applied several times, e.g. when Resource class is decorated.
+            func.__dict__['__latest_oauth_decorator_id__'] = id(decorator)
+
+            # Automatically apply `permissions.ActiveUserRolePermisson`
             # guard if none is yet applied.
             if getattr(func, '_role_permission_applied', False):
                 protected_func = func
             else:
                 protected_func = self.permission_required(
-                    permissions.ActivatedUserRolePermission()
+                    permissions.ActiveUserRolePermission()
                 )(func)
 
-            oauth_protected_func = oauth2.require_oauth(*oauth_scopes)(protected_func)
+            # Accumulate OAuth2 scopes if @login_required decorator is applied
+            # several times
+            if hasattr(protected_func, '__apidoc__') \
+                    and 'security' in protected_func.__apidoc__ \
+                    and '__oauth__' in protected_func.__apidoc__['security']:
+                _oauth_scopes = (
+                    oauth_scopes + protected_func.__apidoc__['security']['__oauth__']['scopes']
+                )
+            else:
+                _oauth_scopes = oauth_scopes
+
+            def oauth_protection_decorator(func):
+                """
+                This helper decorator is necessary to be able to skip redundant
+                checks when Resource class is also decorated.
+                """
+                oauth_protected_func = oauth2.require_oauth(*_oauth_scopes)(func)
+
+                @wraps(oauth_protected_func)
+                def wrapper(self, *args, **kwargs):
+                    """
+                    This wrapper decides whether OAuth2.require_oauth should be
+                    executed to avoid unnecessary calls when ``login_required``
+                    decorator is applied several times.
+                    """
+                    latest_oauth_decorator_id = getattr(
+                        getattr(self, func.__name__),
+                        '__latest_oauth_decorator_id__',
+                        None
+                    )
+                    if id(decorator) == latest_oauth_decorator_id:
+                        _func = oauth_protected_func
+                    else:
+                        _func = func
+                    return _func(self, *args, **kwargs)
+
+                return wrapper
+
+            self._register_access_restriction_decorator(protected_func, oauth_protection_decorator)
+            oauth_protected_func = oauth_protection_decorator(protected_func)
 
             return self.doc(
                 security={
@@ -93,7 +179,7 @@ class Namespace(BaseNamespace):
                     # `Api.add_namespace`.
                     '__oauth__': {
                         'type': 'oauth',
-                        'scopes': oauth_scopes,
+                        'scopes': _oauth_scopes,
                     }
                 }
             )(
@@ -101,9 +187,9 @@ class Namespace(BaseNamespace):
                     code=http_exceptions.Unauthorized.code,
                     description=(
                         "Authentication is required"
-                        if not oauth_scopes else
+                        if not _oauth_scopes else
                         "Authentication with %s OAuth scope(s) is required" % (
-                            ', '.join(oauth_scopes)
+                            ', '.join(_oauth_scopes)
                         )
                     ),
                 )(oauth_protected_func)
@@ -162,6 +248,7 @@ class Namespace(BaseNamespace):
                         return wrapper
 
                 protected_func = _permission_decorator(func)
+                self._register_access_restriction_decorator(protected_func, _permission_decorator)
 
             # Apply `_role_permission_applied` marker for Role Permissions,
             # so don't apply unnecessary permissions in `login_required`
@@ -178,7 +265,7 @@ class Namespace(BaseNamespace):
                         issubclass(permission, permissions.RolePermission)
                     )
             ):
-                protected_func._role_permission_applied = True # pylint: disable=protected-access
+                protected_func._role_permission_applied = True  # pylint: disable=protected-access
 
             permission_description = permission.__doc__.strip()
             return self.doc(
@@ -191,3 +278,43 @@ class Namespace(BaseNamespace):
             )
 
         return decorator
+
+    def _register_access_restriction_decorator(self, func, decorator_to_register):
+        # pylint: disable=invalid-name
+        """
+        Helper function to register decorator to function to perform checks
+        in options method
+        """
+        if not hasattr(func, '_access_restriction_decorators'):
+            func._access_restriction_decorators = []  # pylint: disable=protected-access
+        func._access_restriction_decorators.append(decorator_to_register)  # pylint: disable=protected-access
+
+    @contextmanager
+    def commit_or_abort(self, session, default_error_message="The operation failed to complete"):
+        """
+        Context manager to simplify a workflow in resources
+
+        Args:
+            session: db.session instance
+            default_error_message: Custom error message
+
+        Exampple:
+        >>> with api.commit_or_abort(db.session):
+        ...     team = Team(**args)
+        ...     db.session.add(team)
+        ...     return team
+        """
+        try:
+            try:
+                yield session
+                session.commit()
+            except ValueError as exception:
+                http_exceptions.abort(code=http_exceptions.Conflict.code, message=str(exception))
+            except sqlalchemy.exc.IntegrityError:
+                http_exceptions.abort(
+                    code=http_exceptions.Conflict.code,
+                    message=default_error_message
+                )
+        except HTTPException:
+            session.rollback()
+            raise

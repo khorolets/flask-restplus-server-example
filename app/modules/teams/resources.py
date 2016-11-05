@@ -1,4 +1,5 @@
 # encoding: utf-8
+# pylint: disable=bad-continuation
 """
 RESTful API Team resources
 --------------------------
@@ -6,8 +7,9 @@ RESTful API Team resources
 
 import logging
 
-from flask_restplus import Resource
-import sqlalchemy
+from flask_login import current_user
+from flask_restplus_patched import Resource
+from flask_restplus_patched._http import HTTPStatus
 
 from app.extensions import db
 from app.extensions.api import Namespace, abort, http_exceptions
@@ -15,21 +17,22 @@ from app.extensions.api.parameters import PaginationParameters
 from app.modules.users import permissions
 from app.modules.users.models import User
 
+
 from . import parameters, schemas
 from .models import Team, TeamMember
 
 
-log = logging.getLogger(__name__) # pylint: disable=invalid-name
-api = Namespace('teams', description="Teams") # pylint: disable=invalid-name
+log = logging.getLogger(__name__)  # pylint: disable=invalid-name
+api = Namespace('teams', description="Teams")  # pylint: disable=invalid-name
 
 
 @api.route('/')
+@api.login_required(oauth_scopes=['teams:read'])
 class Teams(Resource):
     """
     Manipulations with teams.
     """
 
-    @api.login_required(oauth_scopes=['teams:read'])
     @api.parameters(PaginationParameters())
     @api.response(schemas.BaseTeamSchema(many=True))
     def get(self, args):
@@ -49,33 +52,29 @@ class Teams(Resource):
         """
         Create a new team.
         """
-        try:
-            try:
-                team = Team(**args)
-            except ValueError as exception:
-                abort(code=http_exceptions.Conflict.code, message=str(exception))
+        with api.commit_or_abort(
+                db.session,
+                default_error_message="Failed to create a new team"
+            ):
+            team = Team(**args)
             db.session.add(team)
-            try:
-                db.session.commit()
-            except sqlalchemy.exc.IntegrityError:
-                abort(code=http_exceptions.Conflict.code, message="Could not create a new team.")
-        finally:
-            db.session.rollback()
+            team_member = TeamMember(team=team, user=current_user, is_leader=True)
+            db.session.add(team_member)
         return team
 
 
 @api.route('/<int:team_id>')
+@api.login_required(oauth_scopes=['teams:read'])
 @api.response(
     code=http_exceptions.NotFound.code,
     description="Team not found.",
 )
+@api.resolve_object_by_model(Team, 'team')
 class TeamByID(Resource):
     """
     Manipulations with a specific team.
     """
 
-    @api.login_required(oauth_scopes=['teams:read'])
-    @api.resolve_object_by_model(Team, 'team')
     @api.permission_required(
         permissions.OwnerRolePermission,
         kwargs_on_request=lambda kwargs: {'obj': kwargs['team']}
@@ -88,7 +87,6 @@ class TeamByID(Resource):
         return team
 
     @api.login_required(oauth_scopes=['teams:write'])
-    @api.resolve_object_by_model(Team, 'team')
     @api.permission_required(
         permissions.OwnerRolePermission,
         kwargs_on_request=lambda kwargs: {'obj': kwargs['team']}
@@ -101,88 +99,46 @@ class TeamByID(Resource):
         """
         Patch team details by ID.
         """
-        try:
-            for operation in args:
-                try:
-                    if not self._process_patch_operation(operation, team=team):
-                        log.info("Team patching has ignored unknown operation %s", operation)
-                except ValueError as exception:
-                    abort(code=http_exceptions.Conflict.code, message=str(exception))
-
+        with api.commit_or_abort(
+                db.session,
+                default_error_message="Failed to update team details."
+            ):
+            parameters.PatchTeamDetailsParameters.perform_patch(args, obj=team)
             db.session.merge(team)
-
-            try:
-                db.session.commit()
-            except sqlalchemy.exc.IntegrityError:
-                abort(
-                    code=http_exceptions.Conflict.code,
-                    message="Could not update team details."
-                )
-        finally:
-            db.session.rollback()
         return team
 
     @api.login_required(oauth_scopes=['teams:write'])
-    @api.resolve_object_by_model(Team, 'team')
     @api.permission_required(
         permissions.OwnerRolePermission,
         kwargs_on_request=lambda kwargs: {'obj': kwargs['team']}
     )
     @api.permission_required(permissions.WriteAccessPermission())
     @api.response(code=http_exceptions.Conflict.code)
+    @api.response(code=HTTPStatus.NO_CONTENT)
     def delete(self, team):
         """
         Delete a team by ID.
         """
-        db.session.delete(team)
-        try:
-            db.session.commit()
-        except sqlalchemy.exc.IntegrityError:
-            db.session.rollback()
-            # TODO: handle errors better
-            abort(
-                code=http_exceptions.Conflict.code,
-                message="Could not delete the team."
-            )
+        with api.commit_or_abort(
+                db.session,
+                default_error_message="Failed to delete the team."
+            ):
+            db.session.delete(team)
         return None
-
-    def _process_patch_operation(self, operation, team):
-        """
-        Args:
-            operation (dict) - one patch operation in RFC 6902 format.
-            team (Team) - team instance which is needed to be patched.
-            state (dict) - inter-operations state storage.
-
-        Returns:
-            processing_status (bool) - True if operation was handled, otherwise False.
-        """
-        if 'value' not in operation:
-            # TODO: handle errors better
-            abort(code=http_exceptions.UnprocessableEntity.code, message="value is required")
-
-        assert operation['path'][0] == '/', "Path must always begin with /"
-        field_name = operation['path'][1:]
-        field_value = operation['value']
-
-        if operation['op'] == parameters.PatchTeamDetailsParameters.OP_REPLACE:
-            setattr(team, field_name, field_value)
-            return True
-
-        return False
 
 
 @api.route('/<int:team_id>/members/')
+@api.login_required(oauth_scopes=['teams:read'])
 @api.response(
     code=http_exceptions.NotFound.code,
     description="Team not found.",
 )
+@api.resolve_object_by_model(Team, 'team')
 class TeamMembers(Resource):
     """
     Manipulations with members of a specific team.
     """
 
-    @api.login_required(oauth_scopes=['teams:read'])
-    @api.resolve_object_by_model(Team, 'team')
     @api.permission_required(
         permissions.OwnerRolePermission,
         kwargs_on_request=lambda kwargs: {'obj': kwargs['team']}
@@ -197,7 +153,6 @@ class TeamMembers(Resource):
         return team.members[args['offset']: args['offset'] + args['limit']]
 
     @api.login_required(oauth_scopes=['teams:write'])
-    @api.resolve_object_by_model(Team, 'team')
     @api.permission_required(
         permissions.OwnerRolePermission,
         kwargs_on_request=lambda kwargs: {'obj': kwargs['team']}
@@ -210,7 +165,10 @@ class TeamMembers(Resource):
         """
         Add a new member to a team.
         """
-        try:
+        with api.commit_or_abort(
+                db.session,
+                default_error_message="Failed to update team details."
+            ):
             user_id = args.pop('user_id')
             user = User.query.get(user_id)
             if user is None:
@@ -219,37 +177,25 @@ class TeamMembers(Resource):
                     message="User with id %d does not exist" % user_id
                 )
 
-            try:
-                team_member = TeamMember(team=team, user=user, **args)
-            except ValueError as exception:
-                abort(code=http_exceptions.Conflict.code, message=str(exception))
-
+            team_member = TeamMember(team=team, user=user, **args)
             db.session.add(team_member)
 
-            try:
-                db.session.commit()
-            except sqlalchemy.exc.IntegrityError:
-                abort(
-                    code=http_exceptions.Conflict.code,
-                    message="Could not update team details."
-                )
-        finally:
-            db.session.rollback()
         return team_member
 
 
 @api.route('/<int:team_id>/members/<int:user_id>')
+@api.login_required(oauth_scopes=['teams:read'])
 @api.response(
     code=http_exceptions.NotFound.code,
     description="Team or member not found.",
 )
+@api.resolve_object_by_model(Team, 'team')
 class TeamMemberByID(Resource):
     """
     Manipulations with a specific team member.
     """
 
     @api.login_required(oauth_scopes=['teams:write'])
-    @api.resolve_object_by_model(Team, 'team')
     @api.permission_required(
         permissions.OwnerRolePermission,
         kwargs_on_request=lambda kwargs: {'obj': kwargs['team']}
@@ -260,17 +206,11 @@ class TeamMemberByID(Resource):
         """
         Remove a member from a team.
         """
-        team_member = TeamMember.query.filter_by(team=team, user_id=user_id).first_or_404()
-        db.session.delete(team_member)
-
-        try:
-            db.session.commit()
-        except sqlalchemy.exc.IntegrityError:
-            db.session.rollback()
-            # TODO: handle errors better
-            abort(
-                code=http_exceptions.Conflict.code,
-                message="Could not update team details."
-            )
+        with api.commit_or_abort(
+                db.session,
+                default_error_message="Failed to update team details."
+            ):
+            team_member = TeamMember.query.filter_by(team=team, user_id=user_id).first_or_404()
+            db.session.delete(team_member)
 
         return None

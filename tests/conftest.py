@@ -9,7 +9,7 @@ from app import create_app
 
 @pytest.yield_fixture(scope='session')
 def flask_app():
-    app = create_app(flask_config='testing')
+    app = create_app(flask_config_name='testing')
     from app.extensions import db
 
     with app.app_context():
@@ -52,7 +52,7 @@ def readonly_user(flask_app):
 
     readonly_user_instance = utils.generate_user_instance(
         username='readonly_user',
-        is_readonly=True
+        is_regular_user=False
     )
 
     db.session.add(readonly_user_instance)

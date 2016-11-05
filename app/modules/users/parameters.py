@@ -1,13 +1,18 @@
 # encoding: utf-8
+# pylint: disable=wrong-import-order
 """
 Input arguments (Parameters) for User resources RESTful API
 -----------------------------------------------------------
 """
 
+from flask_login import current_user
 from flask_marshmallow import base_fields
 from flask_restplus_patched import PostFormParameters, PatchJSONParameters
+from marshmallow import validates_schema, ValidationError
 
-from . import schemas
+from app.extensions.api import abort, http_exceptions
+
+from . import schemas, permissions
 from .models import User
 
 
@@ -33,8 +38,34 @@ class AddUserParameters(PostFormParameters, schemas.BaseUserSchema):
             'recaptcha_key',
         )
 
+    @validates_schema
+    def validate_captcha(self, data):
+        """"
+        Check reCAPTCHA if necessary.
+
+        NOTE: we remove 'recaptcha_key' from data once checked because we don't need it
+        in the resource
+        """
+
+        recaptcha_key = data.pop('recaptcha_key', None)
+        captcha_is_valid = False
+        if not recaptcha_key:
+            no_captcha_permission = permissions.AdminRolePermission()
+            if no_captcha_permission.check():
+                captcha_is_valid = True
+        elif recaptcha_key == 'secret_key':
+            captcha_is_valid = True
+
+        if not captcha_is_valid:
+            abort(code=http_exceptions.Forbidden.code, message="CAPTCHA key is incorrect.")
+
 
 class PatchUserDetailsParameters(PatchJSONParameters):
+    # pylint: disable=abstract-method
+    """
+    User details updating parameters following PATCH JSON RFC.
+    """
+
     PATH_CHOICES = tuple(
         '/%s' % field for field in (
             'current_password',
@@ -44,7 +75,55 @@ class PatchUserDetailsParameters(PatchJSONParameters):
             User.password.key,
             User.email.key,
             User.is_active.fget.__name__,
-            User.is_readonly.fget.__name__,
+            User.is_regular_user.fget.__name__,
             User.is_admin.fget.__name__,
         )
     )
+
+    @classmethod
+    def test(cls, obj, field, value, state):
+        """
+        Additional check for 'current_password' as User hasn't field 'current_password'
+        """
+        if field == 'current_password':
+            if current_user.password != value and obj.password != value:
+                abort(code=http_exceptions.Forbidden.code, message="Wrong password")
+            else:
+                state['current_password'] = value
+                return True
+        return PatchJSONParameters.test(obj, field, value, state)
+
+    @classmethod
+    def replace(cls, obj, field, value, state):
+        """
+        Some fields require extra permissions to be changed.
+
+        Changing `is_active` and `is_regular_user` properties, current user
+        must be a supervisor of the changing user, and `current_password` of
+        the current user should be provided.
+
+        Changing `is_admin` property requires current user to be Admin, and
+        `current_password` of the current user should be provided..
+        """
+        if 'current_password' not in state:
+            raise ValidationError(
+                "Updating sensitive user settings requires `current_password` test operation "
+                "performed before replacements."
+            )
+
+        if field in {'is_active', 'is_readonly'}:
+            with permissions.SupervisorRolePermission(
+                    obj=obj,
+                    password_required=True,
+                    password=state['current_password']
+                ):
+                # Access granted
+                pass
+        elif field == 'is_admin':
+            with permissions.AdminRolePermission(
+                    password_required=True,
+                    password=state['current_password']
+                ):
+                # Access granted
+                pass
+        return super(PatchUserDetailsParameters, cls).replace(obj, field, value, state)
