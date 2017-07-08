@@ -21,42 +21,45 @@ from .models import db, User
 log = logging.getLogger(__name__)
 api = Namespace('users', description="Users")
 
+from flask_restplus_patched import generics
+
 
 @api.route('/')
-class Users(Resource):
+class Users(generics.ListCreateAPIResource):
     """
     Manipulations with users.
     """
 
+    model = User
+    schema = schemas.BaseUserSchema
+    parameters = parameters.AddUserParameters
+    pagination_class = PaginationParameters
+
     @api.login_required(oauth_scopes=['users:read'])
     @api.permission_required(permissions.AdminRolePermission())
-    @api.parameters(PaginationParameters())
-    @api.response(schemas.BaseUserSchema(many=True))
-    def get(self, args):
+    def get(self, *args, **kwargs):
         """
         List of users.
 
         Returns a list of users starting from ``offset`` limited by ``limit``
         parameter.
         """
-        return User.query.offset(args['offset']).limit(args['limit'])
+        return super(Users, self).get(*args, **kwargs)
 
-    @api.parameters(parameters.AddUserParameters())
-    @api.response(schemas.DetailedUserSchema())
-    @api.response(code=HTTPStatus.FORBIDDEN)
-    @api.response(code=HTTPStatus.CONFLICT)
-    @api.doc(id='create_user')
-    def post(self, args):
+    def post(self, *args, **kwargs):
         """
         Create a new user.
         """
-        with api.commit_or_abort(
-                db.session,
-                default_error_message="Failed to create a new user."
-            ):
-            new_user = User(**args)
-            db.session.add(new_user)
-        return new_user
+        return super(Users, self).post(*args, **kwargs)
+
+    def post_method_settings(self, *args, **kwargs):
+        settings = super(self.__class__, self).post_method_settings(*args, **kwargs)
+        settings['response_schemas'] =[
+            {'code': 400},
+            {'code': 409},
+            {'code': 200, 'model': schemas.DetailedUserSchema()}
+        ]
+        return settings
 
 
 @api.route('/signup_form')

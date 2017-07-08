@@ -210,6 +210,10 @@ class Namespace(OriginalNamespace):
                 cls.options = self.preflight_options_handler(
                     self.response(code=HTTPStatus.NO_CONTENT)(cls.options)
                 )
+
+            if getattr(cls, '_document_resource', None):
+                cls._document_resource(namespace=self)
+
             return base_wrapper(cls)
 
         return wrapper
